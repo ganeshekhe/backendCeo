@@ -1,14 +1,25 @@
 
 
+
+
 const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
+const fs = require("fs");
+const path = require("path");
 const Application = require("../models/Application");
 const User = require("../models/User");
 const { verifyToken } = require("../middleware/authMiddleware");
+const Grid = require("gridfs-stream");
 
 const router = express.Router();
+
+let gfs;
+mongoose.connection.once("open", () => {
+  gfs = Grid(mongoose.connection.db, mongoose.mongo);
+  gfs.collection("uploads");
+});
 
 // ✅ GridFS Storage for form PDFs and certificates
 const storage = new GridFsStorage({
@@ -23,6 +34,7 @@ const storage = new GridFsStorage({
 const upload = multer({ storage });
 
 // ================= User Submit Application =================
+
 router.post("/", verifyToken, async (req, res) => {
   try {
     const { serviceId, userId } = req.body;
@@ -50,19 +62,18 @@ router.post("/", verifyToken, async (req, res) => {
         user.otherDocument,
       ]
         .filter(Boolean)
-        .map((doc) => ({
-          filename: doc.filename,
-          fileId: doc.fileId,
-        })),
+        .map((doc) => ({ filename: doc.filename, fileId: doc.fileId })),
     ];
 
     const newApp = new Application({
       user: userId,
-      operator: "687643efe87a4be28c2703ac", // static or dynamic
+      operator: req.user.id,
       service: serviceId,
       data: {},
       documents: [],
       userProfile: {
+        name: user.name || "",
+        caste: user.caste || "",
         gender: user.gender || "",
         dob: user.dob || "",
         profileDocs,
@@ -108,7 +119,7 @@ router.put("/:id/confirm", verifyToken, async (req, res) => {
     const application = await Application.findById(req.params.id);
     if (!application) return res.status(404).json({ message: "Application not found" });
 
-    application.status = "Confirmed"; // or any logic you want
+    application.status = "Confirmed";
     await application.save();
 
     res.json({ message: "Application confirmed", application });
@@ -137,6 +148,95 @@ router.put("/:id/certificate", verifyToken, upload.single("certificate"), async 
     res.json({ message: "Certificate uploaded", fileId: req.file.id });
   } catch (err) {
     res.status(500).json({ message: "Upload failed" });
+  }
+});
+
+
+// ================= Download All Docs (Operator) =================
+router.get("/:userId/download-all", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "operator") {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    if (!mongoose.connection.db) {
+      console.error("❌ MongoDB connection not ready");
+      return res.status(500).json({ message: "Database not connected" });
+    }
+
+    // ✅ Use GridFSBucket (New MongoDB driver API)
+    const gfsBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
+      bucketName: "uploads"
+    });
+
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    console.log(`📌 Download request for user: ${user.name} (${user._id})`);
+
+    const baseDir = "D:\\dump"; // Windows path
+    const userDir = path.join(baseDir, user.name.replace(/[^a-zA-Z0-9]/g, "_"));
+
+    if (!fs.existsSync(userDir)) {
+      fs.mkdirSync(userDir, { recursive: true });
+      console.log(`📁 Created folder: ${userDir}`);
+    }
+
+    const documentFields = [
+      { field: "aadharCard", label: "Aadhaar Card" },
+      { field: "panCard", label: "PAN Card" },
+      { field: "tenthCertificate", label: "10th Certificate" },
+      { field: "tenthMarksheet", label: "10th Marksheet" },
+      { field: "twelfthCertificate", label: "12th Certificate" },
+      { field: "twelfthMarksheet", label: "12th Marksheet" },
+      { field: "graduationDegree", label: "Graduation Degree" },
+      { field: "domicile", label: "Domicile Certificate" },
+      { field: "pgCertificate", label: "PG Certificate" },
+      { field: "casteValidity", label: "Caste Validity" },
+      { field: "otherDocument", label: "Other Document" }
+    ];
+
+    let downloadedCount = 0;
+
+    for (const { field, label } of documentFields) {
+      const doc = user[field];
+      if (doc && doc.filename) {
+        console.log(`📥 Downloading: ${label} → ${doc.filename}`);
+
+        const filePath = path.join(userDir, `${label}${path.extname(doc.filename)}`);
+        const readStream = gfsBucket.openDownloadStreamByName(doc.filename);
+        const writeStream = fs.createWriteStream(filePath);
+
+        await new Promise((resolve) => {
+          readStream
+            .on("error", (err) => {
+              console.error(`❌ Error reading ${label}:`, err);
+              resolve();
+            })
+            .pipe(writeStream)
+            .on("finish", () => {
+              console.log(`✅ Saved: ${filePath}`);
+              downloadedCount++;
+              resolve();
+            })
+            .on("error", (err) => {
+              console.error(`❌ Error writing ${label}:`, err);
+              resolve();
+            });
+        });
+      } else {
+        console.log(`⚠ No file found for: ${label}`);
+      }
+    }
+
+    res.json({
+      message: `Downloaded ${downloadedCount} documents to ${userDir}`,
+      path: userDir
+    });
+
+  } catch (err) {
+    console.error("❌ Download error details:", err);
+    res.status(500).json({ message: "Failed to download all documents", error: err.message });
   }
 });
 
@@ -246,11 +346,13 @@ router.get("/operator", verifyToken, async (req, res) => {
 });
 
 
-// ================= Admin View All Applications =================
+
 
 router.get("/", verifyToken, async (req, res) => {
   try {
-    if (req.user.role !== "admin") return res.status(403).json({ message: "Access denied" });
+    if (!['admin', 'operator'].includes(req.user.role)) {
+      return res.status(403).json({ message: "Access denied" });
+    }
 
     const apps = await Application.find()
       .populate("user", "name mobile")
@@ -262,8 +364,6 @@ router.get("/", verifyToken, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch applications" });
   }
 });
-
-
 // ================= Admin Update Status =================
 
 router.put("/:id/status", verifyToken, async (req, res) => {
@@ -321,8 +421,6 @@ router.put("/:id/operator-confirm", verifyToken, async (req, res) => {
   }
 });
 
-// ✅ बाकी route तुमच्या जुन्या logic प्रमाणे ठेवा (GET user applications, PUT confirm, PUT correction, etc.)
-// त्यामध्ये फक्त filePath ऐवजी GridFS चे fileId आणि filename स्टोअर करा.
 
 // Example for GET /user
 router.get("/user", verifyToken, async (req, res) => {
@@ -334,4 +432,12 @@ router.get("/user", verifyToken, async (req, res) => {
   }
 });
 
+
+
+
+
 module.exports = router;
+
+
+
+

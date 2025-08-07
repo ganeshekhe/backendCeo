@@ -80,9 +80,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// ❌ Remove static disk uploads (we use GridFS now)
-// app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-// app.use("/certificates", express.static(path.join(__dirname, "certificates")));
 
 // ✅ Routes
 app.use("/api/auth", authRoutes);
